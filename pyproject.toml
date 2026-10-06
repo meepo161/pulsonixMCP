@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsonix-mcp"
+version = "0.1.0"
+description = "MCP server for Pulsonix 10.5 via its legacy ActiveX scripting API"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.20"]
+
+[project.scripts]
+pulsonix-mcp = "pulsonix_mcp.server:main"
+
+[tool.setuptools]
+packages = ["pulsonix_mcp"]
+
+[tool.setuptools.package-data]
+pulsonix_mcp = ["jscript/*.jse"]

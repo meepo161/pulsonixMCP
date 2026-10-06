@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Design data and outputs (never publish customer designs)
+*.sch
+*.pcb
+*.bak-*
+*.xlsx
+*.csv
+*.pdf
+
+# Pulsonix documentation is (c) WestDev Ltd - extracted locally at runtime, not redistributed
+docs/
+pulsonix_mcp/apidocs/
+
+# Local tooling
+.omc/
+.claude/
+.idea/
+.vscode/

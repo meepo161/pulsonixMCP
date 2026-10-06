@@ -1,0 +1,87 @@
+// Pulsonix MCP runtime (JScript). Prepended to every generated script.
+// The Python side defines `var P = {...};` before this file.
+// Keep this file ASCII-only: Pulsonix hands the raw bytes to the script engine.
+
+var __fso = new ActiveXObject("Scripting.FileSystemObject");
+var __log = [];
+
+function log(s) { __log.push(String(s)); }
+
+// ---- JSON serializer (JScript has no built-in JSON) -------------------------
+function __q(s) {
+  s = String(s);
+  var out = ['"'];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i), ch = s.charAt(i);
+    if (ch == '"') out.push('\\"');
+    else if (ch == '\\') out.push('\\\\');
+    else if (c == 10) out.push('\\n');
+    else if (c == 13) out.push('\\r');
+    else if (c == 9) out.push('\\t');
+    else if (c < 32) out.push('\\u' + ('000' + c.toString(16)).slice(-4));
+    else out.push(ch);
+  }
+  out.push('"');
+  return out.join('');
+}
+
+function J(v) {
+  if (v === null || v === undefined) return 'null';
+  var t = typeof v;
+  if (t == 'number') return isFinite(v) ? String(v) : 'null';
+  if (t == 'boolean') return v ? 'true' : 'false';
+  if (t == 'string') return __q(v);
+  if (t == 'object' && v instanceof Array) {
+    var a = [];
+    for (var i = 0; i < v.length; i++) a.push(J(v[i]));
+    return '[' + a.join(',') + ']';
+  }
+  if (t == 'object' && (v.constructor === Object)) {
+    var o = [];
+    for (var k in v) if (v.hasOwnProperty(k)) o.push(__q(k) + ':' + J(v[k]));
+    return '{' + o.join(',') + '}';
+  }
+  try { return __q(String(v)); } catch (e) { return 'null'; }
+}
+
+// ---- helpers ----------------------------------------------------------------
+function each(coll, fn) {
+  if (!coll) return;
+  var e = new Enumerator(coll);
+  for (; !e.atEnd(); e.moveNext()) {
+    if (fn(e.item()) === false) break;
+  }
+}
+
+function safe(fn, dflt) {
+  try { var v = fn(); return (v === undefined) ? dflt : v; } catch (e) { return dflt; }
+}
+
+function wildcard(p) {
+  // '*' and '?' wildcards, case-insensitive. Empty/undefined matches everything.
+  if (p === undefined || p === null || p === '') return null;
+  var s = String(p).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp('^' + s + '$', 'i');
+}
+
+function matches(re, s) { return re === null || re.test(String(s)); }
+
+function attrs(item) {
+  var o = {};
+  each(safe(function () { return item.Attributes; }, null), function (a) {
+    o[String(a.Name)] = String(a.Value);
+  });
+  return o;
+}
+
+var MM = 100000.0; // DSU per millimetre
+function mm(dsu) { return Math.round(Number(dsu) / MM * 10000) / 10000; }
+function dsu(mmv) { return Math.round(Number(mmv) * MM); }
+
+function failIf(cond, msg) { if (cond) throw new Error(msg); }
+
+function __writeResult(obj) {
+  var f = __fso.CreateTextFile(P.out, true, true); // overwrite, unicode
+  f.Write(J(obj));
+  f.Close();
+}

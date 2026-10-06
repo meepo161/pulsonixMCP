@@ -1,0 +1,412 @@
+// Pulsonix MCP operations. Each op is OPS[name](D, A) where D is the Document
+// (null for library-only ops) and A is the args object. Return value is sent
+// back to Python as JSON. ASCII-only file.
+
+var OPS = {};
+
+// ---- shared builders -----------------------------------------------------------
+
+function pinNetMap(D) {
+  // "COMP" -> [{pin, net}], built from net nodes like "U6:3".
+  var map = {};
+  each(D.Nets, function (n) {
+    var netName = String(n.Name);
+    each(n.Nodes, function (nd) {
+      if (String(nd.Type) != 'ComponentPad') return;
+      var s = String(nd.Name), i = s.lastIndexOf(':');
+      if (i < 0) return;
+      var c = s.substring(0, i), p = s.substring(i + 1);
+      if (!map[c]) map[c] = [];
+      map[c].push({ pin: p, net: netName });
+    });
+  });
+  return map;
+}
+
+function compInfo(D, c, A) {
+  var o = {
+    name: String(c.Name),
+    part: String(c.PartName),
+    symbol: safe(function () { return String(c.SymbolName); }, null),
+    x_mm: mm(c.X), y_mm: mm(c.Y),
+    angle: safe(function () { return Number(c.Angle); }, null),
+    mirrored: safe(function () { return !!c.Mirrored; }, null),
+    fitted: safe(function () { return !!c.Fitted; }, null),
+    placed: safe(function () { return !!c.Placed; }, null),
+    gates: safe(function () { return Number(c.CountGates()); }, null),
+    pins: safe(function () { return Number(c.CountPins()); }, null)
+  };
+  if (!A || A.include_attributes !== false) o.attributes = attrs(c);
+  if (A && A.include_gates) {
+    o.gate_list = [];
+    each(c.SymbolInstances, function (s) {
+      o.gate_list.push({ symbol: String(s.Name), x_mm: mm(s.X), y_mm: mm(s.Y),
+        angle: safe(function () { return Number(s.Angle); }, null),
+        mirrored: safe(function () { return !!s.Mirrored; }, null) });
+    });
+  }
+  return o;
+}
+
+function findComp(D, name) {
+  var c = D.FindComponent(String(name));
+  failIf(!c, 'Component not found: ' + name);
+  return c;
+}
+
+function findNet(D, name) {
+  var n = D.FindNet(String(name));
+  failIf(!n, 'Net not found: ' + name);
+  return n;
+}
+
+// ---- read ops --------------------------------------------------------------------
+
+OPS.summary = function (D, A) {
+  var pages = [], variants = [];
+  each(D.Pages, function (p) { pages.push(String(p.Name)); });
+  each(D.Variants, function (v) { variants.push({ name: String(v.Name), description: safe(function () { return String(v.Description); }, '') }); });
+  var r = {
+    file: P.original ? String(P.original) : String(D.FullPathName),
+    design_type: String(D.DesignType),
+    is_pcb: !!D.IsPcb, is_schematic: !!D.IsScm,
+    units: String(D.Units),
+    technology_file: safe(function () { return String(D.TechnologyFile); }, null),
+    properties: {
+      title: String(D.Title), subject: String(D.Subject), author: String(D.Author),
+      keywords: String(D.Keywords), comments: String(D.Comments),
+      last_saved_by: String(D.LastSavedBy), revision: safe(function () { return Number(D.RevisionNumber); }, null)
+    },
+    can_save: safe(function () { return !!D.CanSaveDesign(); }, null),
+    counts: {
+      components: D.Components.Count, nets: D.Nets.Count, parts: D.Parts.Count,
+      pages: D.Pages.Count, texts: safe(function () { return D.Text.Count; }, null),
+      doc_symbols: safe(function () { return D.DocSymbols.Count; }, null),
+      errors: safe(function () { return D.Errors.Count; }, null),
+      variants: D.Variants.Count, cam_plots: safe(function () { return D.CamPlots.Count; }, null)
+    },
+    pages: pages,
+    variants: variants,
+    current_variant: safe(function () { return String(D.GetCurrentVariantName()); }, '')
+  };
+  if (D.IsPcb) {
+    r.counts.layers = safe(function () { return D.Layers.Count; }, null);
+    var ext = safe(function () { return D.GetBoardExtents(); }, null);
+    if (ext) r.board_extents_mm = { left: mm(ext.Left), right: mm(ext.Right), top: mm(ext.Top), bottom: mm(ext.Bottom), width: mm(ext.Width), height: mm(ext.Height) };
+  }
+  return r;
+};
+
+OPS.list_components = function (D, A) {
+  var reName = wildcard(A.name), rePart = wildcard(A.part);
+  var attrFilter = A.attribute || null; // {name, value(wildcard, optional)}
+  var reAttr = attrFilter ? wildcard(attrFilter.value) : null;
+  var out = [], limit = A.limit || 100000, total = 0;
+  each(D.Components, function (c) {
+    if (!matches(reName, c.Name) || !matches(rePart, c.PartName)) return;
+    if (attrFilter) {
+      var v = safe(function () { var a = c.FindAttribute(String(attrFilter.name)); return a ? String(a.Value) : null; }, null);
+      if (v === null || !matches(reAttr, v)) return;
+    }
+    total++;
+    if (out.length < limit) out.push(compInfo(D, c, A));
+  });
+  return { total: total, returned: out.length, components: out };
+};
+
+OPS.get_component = function (D, A) {
+  var c = findComp(D, A.name);
+  var o = compInfo(D, c, { include_attributes: true, include_gates: true });
+  var pm = pinNetMap(D);
+  o.connections = pm[String(c.Name)] || [];
+  var p = safe(function () { return c.Part; }, null);
+  if (p) o.part_info = { name: String(p.Name), description: safe(function () { return String(p.Description); }, ''),
+    name_stem: safe(function () { return String(p.NameStem); }, ''), pin_count: safe(function () { return Number(p.PinCount); }, null),
+    default_footprint: safe(function () { return String(p.DefaultFootprintName); }, '') };
+  return o;
+};
+
+OPS.list_nets = function (D, A) {
+  var reName = wildcard(A.name), out = [], limit = A.limit || 100000, total = 0;
+  var withNodes = A.include_nodes !== false, allNodes = !!A.all_node_types;
+  each(D.Nets, function (n) {
+    if (!matches(reName, n.Name)) return;
+    var pins = safe(function () { return Number(n.CountPins()); }, 0);
+    if (A.min_pins && pins < A.min_pins) return;
+    total++;
+    if (out.length >= limit) return;
+    var o = { name: String(n.Name), net_class: safe(function () { return String(n.Class.Name); }, null), pin_count: pins };
+    if (withNodes) {
+      o.nodes = [];
+      each(n.Nodes, function (nd) {
+        var t = String(nd.Type);
+        if (allNodes) o.nodes.push({ name: String(nd.Name), type: t });
+        else if (t == 'ComponentPad') o.nodes.push(String(nd.Name));
+      });
+    }
+    out.push(o);
+  });
+  return { total: total, returned: out.length, nets: out };
+};
+
+OPS.get_net = function (D, A) {
+  var n = findNet(D, A.name), nodes = [];
+  each(n.Nodes, function (nd) { nodes.push({ name: String(nd.Name), type: String(nd.Type) }); });
+  return { name: String(n.Name), net_class: safe(function () { return String(n.Class.Name); }, null),
+    pin_count: safe(function () { return Number(n.CountPins()); }, 0), attributes: attrs(n), nodes: nodes };
+};
+
+OPS.list_parts = function (D, A) {
+  var re = wildcard(A.name), used = {};
+  each(D.Components, function (c) { var k = String(c.PartName); (used[k] = used[k] || []).push(String(c.Name)); });
+  var out = [];
+  each(D.Parts, function (p) {
+    if (!matches(re, p.Name)) return;
+    var nm = String(p.Name);
+    out.push({ name: nm, description: safe(function () { return String(p.Description); }, ''),
+      name_stem: safe(function () { return String(p.NameStem); }, ''), pin_count: safe(function () { return Number(p.PinCount); }, null),
+      used_by: used[nm] || [] });
+  });
+  return { total: out.length, parts: out };
+};
+
+OPS.bom = function (D, A) {
+  var keys = A.group_by_attributes || ['Value'];
+  var groups = {}, order = [];
+  each(D.Components, function (c) {
+    if (A.fitted_only !== false && safe(function () { return !c.Fitted; }, false)) return;
+    var vals = [];
+    for (var i = 0; i < keys.length; i++) vals.push(safe(function () { return String(c.GetAttribute(keys[i])); }, ''));
+    var k = String(c.PartName) + '\u0001' + vals.join('\u0001');
+    if (!groups[k]) {
+      var g = { part: String(c.PartName), attributes: {}, qty: 0, refs: [] };
+      for (var j = 0; j < keys.length; j++) g.attributes[keys[j]] = vals[j];
+      groups[k] = g; order.push(k);
+    }
+    groups[k].qty++; groups[k].refs.push(String(c.Name));
+  });
+  var rows = [];
+  for (var n = 0; n < order.length; n++) rows.push(groups[order[n]]);
+  rows.sort(function (a, b) { return a.part < b.part ? -1 : (a.part > b.part ? 1 : 0); });
+  return { lines: rows.length, rows: rows };
+};
+
+OPS.netlist = function (D, A) {
+  var out = [];
+  each(D.Nets, function (n) {
+    var nodes = [];
+    each(n.Nodes, function (nd) { if (String(nd.Type) == 'ComponentPad') nodes.push(String(nd.Name)); });
+    if (nodes.length || A.include_empty) out.push({ net: String(n.Name), nodes: nodes });
+  });
+  return { nets: out.length, netlist: out };
+};
+
+OPS.list_attribute_names = function (D, A) {
+  var out = [];
+  each(D.AttributeNames, function (a) { out.push(String(a.Name)); });
+  return { total: out.length, names: out };
+};
+
+OPS.list_texts = function (D, A) {
+  var re = wildcard(A.text), out = [];
+  each(D.Text, function (t) {
+    var s = String(t.Text);
+    if (!matches(re, s)) return;
+    out.push({ text: s, x_mm: mm(t.X), y_mm: mm(t.Y) });
+  });
+  return { total: out.length, texts: out };
+};
+
+OPS.list_errors = function (D, A) {
+  var out = [];
+  each(D.Errors, function (e) {
+    out.push({ description: safe(function () { return String(e.Description); }, ''),
+      annotation: safe(function () { return String(e.Annotation); }, ''),
+      location: safe(function () { return String(e.Location); }, ''),
+      notes: safe(function () { return String(e.Notes); }, ''),
+      layer: safe(function () { return String(e.LayerName); }, '') });
+  });
+  return { total: out.length, errors: out };
+};
+
+OPS.design_rule_check = function (D, A) {
+  D.DesignRuleCheck();
+  return OPS.list_errors(D, A);
+};
+
+OPS.list_cam_plots = function (D, A) {
+  var out = [];
+  each(D.CamPlots, function (p) {
+    out.push({ name: String(p.Name), device_type: safe(function () { return String(p.DeviceType); }, ''),
+      device_name: safe(function () { return String(p.DeviceName); }, ''),
+      enabled: safe(function () { return !!p.Enabled; }, null), group: safe(function () { return String(p.Group); }, '') });
+  });
+  return { total: out.length, plots: out };
+};
+
+// ---- write ops -------------------------------------------------------------------
+
+OPS.set_attributes = function (D, A) {
+  // A.changes = { "R1": {"Value": "10k", "Old": null}, ... }  null -> delete
+  var done = [];
+  for (var cn in A.changes) {
+    if (!A.changes.hasOwnProperty(cn)) continue;
+    var c = findComp(D, cn), ch = A.changes[cn];
+    for (var an in ch) {
+      if (!ch.hasOwnProperty(an)) continue;
+      var before = safe(function () { var a = c.FindAttribute(an); return a ? String(a.Value) : null; }, null);
+      if (ch[an] === null) { if (before !== null) c.DeleteAttribute(an); }
+      else c.AddAttribute(an, String(ch[an]));
+      done.push({ component: cn, attribute: an, before: before, after: ch[an] });
+    }
+  }
+  return { changed: done };
+};
+
+OPS.set_net_attributes = function (D, A) {
+  var done = [];
+  for (var nn in A.changes) {
+    if (!A.changes.hasOwnProperty(nn)) continue;
+    var n = findNet(D, nn), ch = A.changes[nn];
+    for (var an in ch) {
+      if (!ch.hasOwnProperty(an)) continue;
+      if (ch[an] === null) n.DeleteAttribute(an); else n.AddAttribute(an, String(ch[an]));
+      done.push({ net: nn, attribute: an, after: ch[an] });
+    }
+  }
+  return { changed: done };
+};
+
+OPS.rename_components = function (D, A) {
+  // A.renames = {"R1": "R101", ...}
+  var done = [];
+  for (var o in A.renames) {
+    if (!A.renames.hasOwnProperty(o)) continue;
+    var c = findComp(D, o);
+    failIf(D.FindComponent(String(A.renames[o])) && String(A.renames[o]) != o, 'Target name already exists: ' + A.renames[o]);
+    c.Name = String(A.renames[o]);
+    done.push({ from: o, to: String(c.Name) });
+  }
+  return { renamed: done };
+};
+
+OPS.move_component = function (D, A) {
+  var c = findComp(D, A.name);
+  var before = { x_mm: mm(c.X), y_mm: mm(c.Y) };
+  c.MoveTo(dsu(A.x_mm), dsu(A.y_mm));
+  return { name: String(c.Name), before: before, after: { x_mm: mm(c.X), y_mm: mm(c.Y) } };
+};
+
+OPS.set_fitted = function (D, A) {
+  if (A.variant !== undefined && A.variant !== null) failIf(!D.SelectVariant(String(A.variant)), 'Cannot select variant: ' + A.variant);
+  var done = [];
+  for (var i = 0; i < A.names.length; i++) {
+    var c = findComp(D, A.names[i]);
+    c.Fitted = !!A.fitted;
+    done.push({ name: String(c.Name), fitted: !!c.Fitted });
+  }
+  return { variant: safe(function () { return String(D.GetCurrentVariantName()); }, ''), changed: done };
+};
+
+OPS.add_component = function (D, A) {
+  var c = D.AddComponent(String(A.part), String(A.part_rep || ''), String(A.name || ''));
+  failIf(!c, 'AddComponent failed for part ' + A.part);
+  if (A.x_mm !== undefined && A.y_mm !== undefined) c.MoveTo(dsu(A.x_mm), dsu(A.y_mm));
+  if (A.attributes) for (var k in A.attributes) if (A.attributes.hasOwnProperty(k)) c.AddAttribute(k, String(A.attributes[k]));
+  return compInfo(D, c, { include_attributes: true, include_gates: true });
+};
+
+OPS.add_net = function (D, A) {
+  var n = (A.local === undefined) ? D.AddNet(String(A.name), String(A.net_class || '')) : D.AddNet(String(A.name), String(A.net_class || ''), !!A.local);
+  failIf(!n, 'AddNet failed: ' + A.name);
+  return { name: String(n.Name) };
+};
+
+OPS.add_node = function (D, A) {
+  var n = findNet(D, A.net);
+  var nd = n.AddNode(String(A.component), String(A.pin));
+  failIf(!nd, 'AddNode failed');
+  return { net: String(n.Name), node: String(nd.Name) };
+};
+
+OPS.set_properties = function (D, A) {
+  var map = { title: 'Title', subject: 'Subject', author: 'Author', keywords: 'Keywords', comments: 'Comments', last_saved_by: 'LastSavedBy' };
+  var done = {};
+  for (var k in A.properties) {
+    if (!A.properties.hasOwnProperty(k)) continue;
+    failIf(!map[k], 'Unknown property: ' + k);
+    D[map[k]] = String(A.properties[k]);
+    done[k] = String(D[map[k]]);
+  }
+  return done;
+};
+
+// ---- outputs ---------------------------------------------------------------------
+
+OPS.write_plots = function (D, A) {
+  var pw = D.NewPlotWriter();
+  failIf(!pw, 'NewPlotWriter failed');
+  var res = [];
+  if (A.plot_names && A.plot_names.length) {
+    for (var i = 0; i < A.plot_names.length; i++) {
+      var ok = A.output_path ? pw.WritePlot(A.plot_names[i], A.output_path) : pw.WritePlot(A.plot_names[i]);
+      res.push({ plot: A.plot_names[i], ok: !!ok });
+    }
+  } else {
+    failIf(!A.device, 'Give plot_names or device');
+    var ok2 = A.output_path ? pw.WriteDevicePlots(A.device, A.output_path) : pw.WriteDevicePlots(A.device);
+    res.push({ device: A.device, ok: !!ok2 });
+  }
+  return { results: res };
+};
+
+OPS.run_report = function (D, A) {
+  D.RunReport(String(A.report_name), String(A.output_path));
+  return { report: A.report_name, output_path: A.output_path, exists: __fso.FileExists(A.output_path) };
+};
+
+OPS.generate = function (D, A) {
+  // kind: STEP | ODB | IPC2581 (PCB only)
+  var k = String(A.kind).toUpperCase(), s = A.settings_xml ? String(A.settings_xml) : '';
+  var ok;
+  if (k == 'STEP') ok = D.GenerateSTEP(String(A.output_path), s);
+  else if (k == 'ODB') ok = D.GenerateODB(String(A.output_path), s);
+  else if (k == 'IPC2581') ok = D.GenerateIPC2581(String(A.output_path), s);
+  else throw new Error('Unknown kind: ' + A.kind);
+  return { kind: k, ok: !!ok, output_path: A.output_path };
+};
+
+// ---- library ops (no design needed) -----------------------------------------------
+
+OPS.library_parts = function (D, A) {
+  var lib = Application.OpenPartLibrary(String(A.library), true);
+  failIf(!lib, 'Cannot open part library: ' + A.library);
+  var re = wildcard(A.name), out = [], limit = A.limit || 5000, total = 0;
+  each(lib.Parts, function (p) {
+    if (!matches(re, p.Name)) return;
+    total++;
+    if (out.length < limit) out.push({ name: String(p.Name), description: safe(function () { return String(p.Description); }, ''),
+      pin_count: safe(function () { return Number(p.PinCount); }, null) });
+  });
+  return { library: String(lib.FullPathName), total: total, returned: out.length, parts: out };
+};
+
+// ---- application-level -----------------------------------------------------------
+
+OPS.app_info = function (D, A) {
+  var docs = [];
+  each(Application.Documents, function (d) { docs.push({ file: String(d.FullPathName), type: String(d.DesignType) }); });
+  var act = safe(function () { return Application.ActiveDocument; }, null);
+  return { document_count: Application.GetDocumentCount(), active: act ? String(act.FullPathName) : null, documents: docs,
+    engine: ScriptEngine() + ' ' + ScriptEngineMajorVersion() + '.' + ScriptEngineMinorVersion() };
+};
+
+OPS.run_command = function (D, A) { Application.RunCommand(String(A.command)); return { ran: A.command }; };
+OPS.run_macro = function (D, A) { Application.RunMacro(String(A.macro)); return { ran: A.macro }; };
+
+// ---- escape hatch -----------------------------------------------------------------
+
+OPS.run_script = function (D, A) {
+  var fn = new Function('D', 'args', 'log', 'each', 'attrs', 'mm', 'dsu', String(A.code));
+  return fn(D, A.args || {}, log, each, attrs, mm, dsu);
+};
