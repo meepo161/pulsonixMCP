@@ -243,3 +243,7 @@ pulsonix_mcp/
 ```
 
 Новая операция = функция `OPS.<имя>(D, A)` в `ops.jse` + обёртка `@mcp.tool()` в `server.py`.
+
+## Лицензия
+
+[MIT](LICENSE). Pulsonix — товарный знак WestDev Ltd; проект не связан с WestDev и не содержит их документации.
